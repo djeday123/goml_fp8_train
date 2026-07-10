@@ -1,0 +1,45 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.so.*
+*.a
+*.dylib
+
+# Generated stitched kernel
+src/_v121r_kernel_full.cu
+
+# Logs and profile dumps
+*.log
+*.txt.tmp
+nsight-systems-*.qdrep
+*.ncu-rep
+*.nsys-rep
+
+# SASS / PTX dumps (allow only docs/ examples if they appear)
+*.sass
+*.ptx
+!docs/examples/*.sass
+!docs/examples/*.ptx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Go
+go.sum
+vendor/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Local config
+.env
+.envrc

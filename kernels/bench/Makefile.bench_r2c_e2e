@@ -1,0 +1,15 @@
+NVCC     := /usr/local/cuda-13.1/bin/nvcc
+ARCH     := -gencode arch=compute_120a,code=sm_120a
+STD      := -std=c++17
+OPT      := -O3
+PTXFLAGS := -Xptxas=-v -lineinfo
+
+BIN  := bench_r2c_e2e
+SRCS := bench_r2c_e2e.cu fa_bwd_merged_v1.cu fa_bwd_dq.cu fa_bwd_dq_new.cu \
+        fa_bwd_dk.cu fa_bwd_dk_new.cu fa_bwd_dv_mma_p1.cu fa_bwd_ds_gen.cu
+
+$(BIN): $(SRCS)
+	$(NVCC) $(OPT) $(ARCH) $(STD) $(PTXFLAGS) $(SRCS) -o $(BIN) 2>&1 | tee bench_r2c_e2e_build.log
+
+clean:
+	rm -f $(BIN) bench_r2c_e2e_build.log

@@ -1,0 +1,5 @@
+*.log
+*.o
+*.bin
+bench_r2c_e2e
+/tmp/

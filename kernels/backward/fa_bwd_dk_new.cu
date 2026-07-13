@@ -1,13 +1,15 @@
-// R1b-fix: kernel_dk_new v2 with Q → Q_T transpose phase.
+// S2v4: kernel_dk_new через свизл писателя smQ + LDSM.x2.trans.b8-читатель.
 //   dK[j][d] = sum_i dS^T[j,i] * Q[i,d]
-//   MMA m16n8k32 row.col:
-//     A [M=j][K=i] row-major = dS_T   (Bc rows × Br cols, stride Br)
-//     B [K=i][N=d] col-major = Q_T[d][i] row-major с stride QT_STRIDE (mirror sealed dK)
-//   → Q loaded row-major → transposed to smQ_T (mirror sealed dK phase 1.5).
+//   MMA m16n8k32.e4m3.e4m3.f32:
+//     A [M=j][K=i] row-major = smdS_T (Bc × Br, stride Br) — без изменений
+//     B [K=i][N=d] = fp8 из смQ через LDSM.x2.trans.b8 с свизлом swz_byte
+//   Q_T pack (feeder 16 LDS + 12 SHFL + 16 STS + π_V + smQ_T 8704B + барьер line 310) — УДАЛЁН.
+//   Свизл писателя: cp.async(smQ_row_ptr[swz_byte(i_local, col_byte)]).
+//   Ридер: LDSM.x2.trans.b8 с row_ptr 049-B (lane-shift, in-bounds) + свизл-поправка.
+//   Мост 060 (row 100% 16384/16384 + 64/64 rows) + 061 (col 100% 128/128 cols + MMA-B fragment order).
 //
-//   Grid: bh × n_kt (block owns K-tile).
-//   Loop qt: load Q + dS_T tile → transpose Q → smQ_T → MMA.
-//   Epilogue: dK_acc * scale → global.
+//   SMEM 12288 B (smQ 8192 + smdS_T 4096), было 20992. Blocks/SM ≥ 4 (SMEM headroom).
+//   Барьеры: t1a nat-data ready + t1b T-layout ready + t2 end-qt (было 4).
 
 #include <cstdio>
 #include <cstdint>
@@ -67,12 +69,11 @@ __global__ void kernel_dk_new(
     if (b >= bh) return;
     const int j_base = kt * Bc;
 
-    // SMEM: smQ (Br*Hd=8192) + smQ_T (Hd*QT_STRIDE=8704) + smdS_T (Bc*Br=4096) = 20992 B.
-    //   4 blocks/SM (SMEM-limited, floor(102400/(20992+1024))=4).
+    // S2v4 SMEM: smQ (Br*Hd=8192 свизлован) + smdS_T (Bc*Br=4096) = 12288 B.
+    //   smQ_T (8704B) УДАЛЁН — LDSM.x2.trans.b8 читает свизлованный smQ напрямую.
     extern __shared__ uint8_t smem_raw[];
-    uint8_t *smQ    = smem_raw;                             // 8192
-    uint8_t *smQ_T  = smem_raw + Br * Hd;                   // 8704 (stride QT_STRIDE)
-    uint8_t *smdS_T = smem_raw + Br * Hd + Hd * QT_STRIDE;  // 4096
+    uint8_t *smQ    = smem_raw;                             // 8192 (свизлован)
+    uint8_t *smdS_T = smem_raw + Br * Hd;                   // 4096
 
     // dK_acc FP32 [16][4] = 64 regs
     float dK_acc[NI_DK][4];
@@ -87,7 +88,7 @@ __global__ void kernel_dk_new(
     for (int qt = qt_start; qt < n_qt; ++qt) {
         const int i_base = qt * Br;
 
-        // cp.async Q rows → smQ (Br*Hd = 8KB, 16-byte chunks × 512 total)
+        // S2v4: cp.async Q rows → smQ СВИЗЛОВАННЫЙ (swz_byte, дословно из моста 060).
         {
             const uint8_t *Qb = Q + b * sl * Hd;
             constexpr int CHUNK = 16;
@@ -98,11 +99,11 @@ __global__ void kernel_dk_new(
                 int col_byte = (c % cpr) * CHUNK;
                 int i_g = i_base + i_local;
                 bool in_bounds = (i_g < sl);
+                int dst_off = swz_byte(i_local, col_byte);   // ← СВИЗЛ (было i_local * Hd + col_byte)
                 if (in_bounds) {
-                    cpa16(&smQ[i_local * Hd + col_byte],
-                          &Qb[i_g * Hd + col_byte], CHUNK);
+                    cpa16(&smQ[dst_off], &Qb[i_g * Hd + col_byte], CHUNK);
                 } else {
-                    uint32_t *sp = reinterpret_cast<uint32_t*>(&smQ[i_local * Hd + col_byte]);
+                    uint32_t *sp = reinterpret_cast<uint32_t*>(&smQ[dst_off]);
                     sp[0] = 0u; sp[1] = 0u; sp[2] = 0u; sp[3] = 0u;
                 }
             }
@@ -219,99 +220,12 @@ __global__ void kernel_dk_new(
         }
         __syncthreads();   // BARRIER #1b: T layout ready
 
-        // Load Q fragments (matches sealed dK step B pattern) → Qr[KS_QK][4].
-        //   Per lane: 4 ks × 4 u32 = 16 LDS.U32.
-        uint32_t Qr[KS_QK][4];
-        #pragma unroll
-        for (int ks = 0; ks < KS_QK; ++ks) {
-            int m_lo = wid * 16 + l_div4 + 0;
-            int m_hi = wid * 16 + l_div4 + 8;
-            int k_lo = ks * 32 + l_mod4 * 4 + 0;
-            int k_hi = ks * 32 + l_mod4 * 4 + 16;
-            Qr[ks][0] = *reinterpret_cast<uint32_t*>(&smQ[m_lo * Hd + k_lo]);
-            Qr[ks][1] = *reinterpret_cast<uint32_t*>(&smQ[m_hi * Hd + k_lo]);
-            Qr[ks][2] = *reinterpret_cast<uint32_t*>(&smQ[m_lo * Hd + k_hi]);
-            Qr[ks][3] = *reinterpret_cast<uint32_t*>(&smQ[m_hi * Hd + k_hi]);
-        }
-
-        // Transpose Qr → smQ_T via pack (Vugar spec verbatim, unit-tested 8192/8192).
-        //   Фазы A/B/C/D: gather-PRMT / SHFL exchange / receive-PRMT / STS.32
-        //   Счёт per qt/lane: 12 SHFL + 16 STS.32 + 64 PRMT + 24 SEL, 0 STS.U8, 0 LDL/STL.
-        //   Coords: c = l_mod4, p = l_div4 & 3, h = l_div4 >> 2 (quad structure).
-        {
-            const int c = l_mod4;
-            const int p = l_div4 & 3;
-            const int h = l_div4 >> 2;
-            #pragma unroll
-            for (int s = 0; s < 4; ++s) {
-                // Фаза A — gather вдоль ks (8 PRMT, fixed selectors)
-                uint32_t t01_lo, t01_hi, t23_lo, t23_hi;
-                asm volatile("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(t01_lo) : "r"(Qr[0][s]), "r"(Qr[1][s]));
-                asm volatile("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(t01_hi) : "r"(Qr[0][s]), "r"(Qr[1][s]));
-                asm volatile("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(t23_lo) : "r"(Qr[2][s]), "r"(Qr[3][s]));
-                asm volatile("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(t23_hi) : "r"(Qr[2][s]), "r"(Qr[3][s]));
-                uint32_t G0, G1, G2, G3;
-                asm volatile("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(G0) : "r"(t01_lo), "r"(t23_lo));
-                asm volatile("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(G1) : "r"(t01_lo), "r"(t23_lo));
-                asm volatile("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(G2) : "r"(t01_hi), "r"(t23_hi));
-                asm volatile("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(G3) : "r"(t01_hi), "r"(t23_hi));
-
-                // Фаза B — обмен (3 SHFL, rounds r=1..3). V0..V3 в регистрах (без local memory).
-                //   src(r) = c + 4*((p−r)&3) + 16h, expose(r) = G[(p+r)&3]
-                uint32_t V0 = G0, V1 = G1, V2 = G2, V3 = G3;   // init with own G[i]
-                #pragma unroll
-                for (int r = 1; r <= 3; ++r) {
-                    int src_p = (p - r) & 3;
-                    int src_lane = c + 4 * src_p + 16 * h;
-                    int idx = (p + r) & 3;
-                    // Two-level SEL: expose_val = G[idx]
-                    uint32_t lo = (idx & 1) ? G1 : G0;
-                    uint32_t hi = (idx & 1) ? G3 : G2;
-                    uint32_t expose_val = (idx & 2) ? hi : lo;
-                    uint32_t val = __shfl_sync(0xFFFFFFFF, expose_val, src_lane);
-                    // Conditional SEL-based write to V0..V3 (compile-time indexed vars)
-                    V0 = (src_p == 0) ? val : V0;
-                    V1 = (src_p == 1) ? val : V1;
-                    V2 = (src_p == 2) ? val : V2;
-                    V3 = (src_p == 3) ? val : V3;
-                }
-                // Own p stays as G[p] via init (no override needed since src_p != p in Phase B)
-
-                // Фаза C — приёмное транспонирование (8 PRMT, тот же tree)
-                uint32_t u01_lo, u01_hi, u23_lo, u23_hi;
-                asm volatile("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(u01_lo) : "r"(V0), "r"(V1));
-                asm volatile("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(u01_hi) : "r"(V0), "r"(V1));
-                asm volatile("prmt.b32 %0, %1, %2, 0x5140;" : "=r"(u23_lo) : "r"(V2), "r"(V3));
-                asm volatile("prmt.b32 %0, %1, %2, 0x7362;" : "=r"(u23_hi) : "r"(V2), "r"(V3));
-                uint32_t OUT0, OUT1, OUT2, OUT3;
-                asm volatile("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(OUT0) : "r"(u01_lo), "r"(u23_lo));
-                asm volatile("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(OUT1) : "r"(u01_lo), "r"(u23_lo));
-                asm volatile("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(OUT2) : "r"(u01_hi), "r"(u23_hi));
-                asm volatile("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(OUT3) : "r"(u01_hi), "r"(u23_hi));
-
-                // Фаза D — стор (4 STS.32 per slot) с π_V на row
-                //   π_V(r) = ((r&7)<<2) | (((r>>3)&1)<<1) | ((r>>4)&1) | (r & 0x60)
-                //   Bit-perm: r0→2, r1→3, r2→4, r3→1, r4→0, r5,r6 fixed
-                //   Даёт биекцию 32 lanes → 32 банка per STS.32 (21 pt.2-fix ✓, P24/P25 = 0.00)
-                int colbase = wid * 16 + 8 * (s & 1) + 4 * h;
-                int row_base_ks = 16 * (s >> 1) + 4 * c + p;
-                #define PI_V(r) ((((r) & 7) << 2) | ((((r) >> 3) & 1) << 1) | (((r) >> 4) & 1) | ((r) & 0x60))
-                int row0 = 0 * 32 + row_base_ks;
-                int row1 = 1 * 32 + row_base_ks;
-                int row2 = 2 * 32 + row_base_ks;
-                int row3 = 3 * 32 + row_base_ks;
-                *reinterpret_cast<uint32_t*>(&smQ_T[PI_V(row0) * QT_STRIDE + colbase]) = OUT0;
-                *reinterpret_cast<uint32_t*>(&smQ_T[PI_V(row1) * QT_STRIDE + colbase]) = OUT1;
-                *reinterpret_cast<uint32_t*>(&smQ_T[PI_V(row2) * QT_STRIDE + colbase]) = OUT2;
-                *reinterpret_cast<uint32_t*>(&smQ_T[PI_V(row3) * QT_STRIDE + colbase]) = OUT3;
-                #undef PI_V
-            }
-        }
-        __syncthreads();
-
-        // MMA dS_T · Q_T → dK_acc.
-        //   A = smdS_T [M=j][K=i] row-major stride Br
-        //   B = smQ_T  [N=d][K=i] row-major stride QT_STRIDE (== col-major B[K=i][N=d])
+        // S2v4 MMA dS_T · Q → dK_acc через LDSM.x2.trans.b8 (свизлованный smQ).
+        //   A = smdS_T (dS transposed already) — MMA-A читатель unchanged
+        //   B = fp8 из смQ через LDSM lo (b0) + LDSM hi (b1); мост 060+061 100%
+        //   Мост дифф: row_ptr = swz_byte(kb*32+lane, np*16) lo / swz_byte(kb*32+(lane&15)+16, np*16) hi
+        //   LDSM output layout: R0 = b0 for ni_a, R1 = b0 for ni_b; R2=R0 dup, R3=R1 dup (ISA-квирк 045)
+        //   MMA calls: ni_a using (R0_lo, R0_hi); ni_b using (R1_lo, R1_hi)
         #pragma unroll
         for (int kb = 0; kb < KB_DK; ++kb) {
             int m_lo = wid * 16 + l_div4 + 0;
@@ -325,19 +239,37 @@ __global__ void kernel_dk_new(
             uint32_t A3 = *reinterpret_cast<uint32_t*>(&smdS_T[m_hi * Br + k_i_hi]);
 
             #pragma unroll
-            for (int ni = 0; ni < NI_DK; ++ni) {
-                int n_d = ni * 8 + l_div4;
-                // π_V B-load — mirror of Phase D π_V write
-                #define PI_V(r) ((((r) & 7) << 2) | ((((r) >> 3) & 1) << 1) | (((r) >> 4) & 1) | ((r) & 0x60))
-                int n_d_pi = PI_V(n_d);
-                uint32_t B0 = *reinterpret_cast<uint32_t*>(&smQ_T[n_d_pi * QT_STRIDE + k_i_lo]);
-                uint32_t B1 = *reinterpret_cast<uint32_t*>(&smQ_T[n_d_pi * QT_STRIDE + k_i_hi]);
-                #undef PI_V
+            for (int np = 0; np < NI_DK / 2; ++np) {
+                const int ni_a = 2 * np;
+                const int ni_b = 2 * np + 1;
 
+                // LDSM lo — b0 fragments (k=lo_range)
+                int row_lo = kb * 32 + lane;
+                int addr_lo = swz_byte(row_lo, np * 16);
+                uint32_t sm_addr_lo = __cvta_generic_to_shared(&smQ[addr_lo]);
+                uint32_t B0a_lo, B0b_lo, Dlo0, Dlo1;
+                asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"
+                    : "=r"(B0a_lo), "=r"(B0b_lo), "=r"(Dlo0), "=r"(Dlo1) : "r"(sm_addr_lo));
+
+                // LDSM hi — b1 fragments (k=hi_range)
+                int row_hi = kb * 32 + (lane & 15) + 16;
+                int addr_hi = swz_byte(row_hi, np * 16);
+                uint32_t sm_addr_hi = __cvta_generic_to_shared(&smQ[addr_hi]);
+                uint32_t B0a_hi, B0b_hi, Dhi0, Dhi1;
+                asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3},[%4];\n"
+                    : "=r"(B0a_hi), "=r"(B0b_hi), "=r"(Dhi0), "=r"(Dhi1) : "r"(sm_addr_hi));
+
+                // MMA for ni_a: B = (B0a_lo=b0, B0a_hi=b1)
                 mma_m16n8k32_e4m3_f32(
-                    dK_acc[ni][0], dK_acc[ni][1], dK_acc[ni][2], dK_acc[ni][3],
-                    A0, A1, A2, A3, B0, B1,
-                    dK_acc[ni][0], dK_acc[ni][1], dK_acc[ni][2], dK_acc[ni][3]);
+                    dK_acc[ni_a][0], dK_acc[ni_a][1], dK_acc[ni_a][2], dK_acc[ni_a][3],
+                    A0, A1, A2, A3, B0a_lo, B0a_hi,
+                    dK_acc[ni_a][0], dK_acc[ni_a][1], dK_acc[ni_a][2], dK_acc[ni_a][3]);
+
+                // MMA for ni_b: B = (B0b_lo=b0, B0b_hi=b1)
+                mma_m16n8k32_e4m3_f32(
+                    dK_acc[ni_b][0], dK_acc[ni_b][1], dK_acc[ni_b][2], dK_acc[ni_b][3],
+                    A0, A1, A2, A3, B0b_lo, B0b_hi,
+                    dK_acc[ni_b][0], dK_acc[ni_b][1], dK_acc[ni_b][2], dK_acc[ni_b][3]);
             }
         }
         __syncthreads();
@@ -384,7 +316,7 @@ void launch_dk_new(
     const int Br = FA_DKN_BR;
     const int n_kt = (sl + Bc - 1) / Bc;
     const int grid = bh * n_kt;
-    const int smem_bytes = Br * hd + hd * FA_DKN_QT_STRIDE + Bc * Br;  // 8192 + 8704 + 4096
+    const int smem_bytes = Br * hd + Bc * Br;  // 8192 + 4096 = 12288 (S2v4: smQ_T removed)
     cudaFuncSetAttribute(kernel_dk_new,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     kernel_dk_new<<<grid, FA_DKN_THREADS, smem_bytes, stream>>>(

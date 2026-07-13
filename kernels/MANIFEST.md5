@@ -1,11 +1,13 @@
 # MANIFEST.md5 — sealed-ядра goml_fp8_train
-# Провенанс: goml @ commit 4732a380a817e63d8592532f87e1daf26ec9d2f8, тег w0-seal-v1
-# Дата клона (UTC): 2026-07-10
-# CUDA: 13.1.1 (/usr/local/cuda-13.1/bin/nvcc, nvcc 13.1.115) | driver: 580.159.03 | GPU: NVIDIA RTX PRO 6000 Blackwell (sm_120a)
+# Провенанс: goml @ commit 2314cbead0fc230792bab785fca886dc584404e4, тег bwd-sealed-v2
+#   "seal: FP8 bwd v2 (42.35ms E2E / 415.44T proj) — 061 S2v4 dk_new"
+# Предыдущая эпоха: w0-seal-v1 (4732a380) — dk_new 128 рег; заменена v2 (dk_new 124 рег, S2v4).
+# Дата обновления (UTC): 2026-07-13
+# CUDA: 13.1.1 (/usr/local/cuda-13.1/bin/nvcc) | driver: 580.159.03 | GPU: NVIDIA RTX PRO 6000 Blackwell (sm_120a)
 
 ## backward (kernels/backward/)
 2bf32ab7d4c5ecabb4ee2dbf1b5d4b33  fa_bwd_merged_v1.cu
-a9f0ded8261e53a143b521ffa647f458  fa_bwd_dk_new.cu
+25e5e1077cc3bec2c49bf9288fe60c54  fa_bwd_dk_new.cu
 d7a11a3d788eb4c396d892bc9c8ab754  fa_bwd_dq_new.cu
 4407ec9cf64708a2a28dc36633d5d6f1  fa_bwd_common.cuh
 068d6a4fdf5ae04816ebca199b9293cc  fa_bwd_dk.cu
@@ -13,11 +15,15 @@ d7a11a3d788eb4c396d892bc9c8ab754  fa_bwd_dq_new.cu
 ## forward train-ядро (kernels/forward/fa_sm120/src/)
 2cf06fd08e750cf4e52bf8c72b1ead2b  _v121r_train_kernel.cu
 
+## Fingerprint (регистры, самопроверка bench_r2c_e2e)
+# kernel_d_precompute  38
+# kernel_merged_v1    252
+# kernel_dk_new       124   <- v2 (S2v4: LDSM.x2.trans.b8 + свизл, pack удалён; -4r vs 128 base)
+# kernel_dq_new        69
+
 ## Примечания
-# - merged_v1 взят из НЕИЗМЕННОГО архива runs/archive/040_sealed (= 2bf32ab7), НЕ из рабочей libs/
-#   (opt-ветка активно правит libs/fa_bwd_merged_v1.cu).
-# - dk_new взят из runs/archive/033_sealed (= a9f0ded8), НЕ из libs/ — на момент клона opt-ветка
-#   увела libs/fa_bwd_dk_new.cu на стадию 061 (25e5e107, 124 рег). Sealed = 033 (a9f0ded8, 128 рег).
-# - dq_new / common.cuh / dk.cu взяты из libs/ (на момент клона совпадали с тегом byte-exact).
+# - v1 -> v2 дельта: изменился ТОЛЬКО fa_bwd_dk_new.cu (a9f0ded8 -> 25e5e107). Остальные 4 байт-в-байт те же.
 # - D-precompute (kernel_d_precompute) живёт ВНУТРИ fa_bwd_dk.cu; там же мёртвый kernel_dk — НЕ используется.
-# - forward train-ядро _v121r_train_kernel.cu совпало с тегом byte-exact (2cf06fd0); эмитит LSE (L=m_i+log(l_i)).
+# - forward train-ядро _v121r_train_kernel.cu (2cf06fd0) эмитит LSE (L = m_i + log(l_i)).
+# - bench_r2c_e2e.cu (reference) ждёт dk_new=124 и содержит патч 070 (dS_T dead-alloc removed) —
+#   с v2 fingerprint сходится естественно.
